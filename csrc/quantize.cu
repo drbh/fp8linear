@@ -9,6 +9,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cstdlib>
+#include <cublas_v2.h>  // for CUBLAS_VERSION (MX path gated to cuBLAS >= 12.8)
 #include <cuda_fp8.h>
 #include <torch/torch.h>
 
@@ -192,14 +193,17 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8(torch::Tensor x) {
 // force the per-channel path even on Blackwell (escape hatch while MX is validated).
 std::tuple<torch::Tensor, torch::Tensor> quantize_weight(torch::Tensor weight) {
   TORCH_CHECK(weight.is_cuda() && weight.dim() == 2, "weight must be a 2D CUDA tensor");
+
+#if CUBLAS_VERSION >= 120800
+  // MXFP8 only on Blackwell AND only in cu128+ builds (the MX matmul needs it).
   const int major = at::cuda::getCurrentDeviceProperties()->major;
   const bool force_fp8 = std::getenv("FP8LINEAR_NO_MX") != nullptr;
-
   if (major >= 10 && !force_fp8) {
     auto w = (weight.scalar_type() == torch::kFloat) ? weight.to(torch::kBFloat16)
                                                      : weight;
     return quantize_mxfp8(w);
   }
+#endif
 
   // Per-channel (per-output-row) e4m3.
   auto amax = weight.detach().abs().amax(1).to(torch::kFloat);

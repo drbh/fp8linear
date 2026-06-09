@@ -12,6 +12,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cublasLt.h>
+#include <cublas_v2.h>  // for CUBLAS_VERSION
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <torch/torch.h>
@@ -219,6 +220,9 @@ torch::Tensor mxfp8_gemm(torch::Tensor xq,
                          torch::Tensor wq,
                          torch::Tensor w_scales,
                          std::optional<torch::Tensor> bias) {
+  // The MX (VEC32_UE8M0) scale modes were added in cuBLAS 12.8; the build matrix
+  // also compiles cu126 variants where they don't exist, so guard on the version.
+#if CUBLAS_VERSION >= 120800
   TORCH_CHECK(xq.is_cuda() && wq.is_cuda(), "inputs must be on CUDA");
   TORCH_CHECK(xq.scalar_type() == torch::kFloat8_e4m3fn &&
                   wq.scalar_type() == torch::kFloat8_e4m3fn,
@@ -293,6 +297,12 @@ torch::Tensor mxfp8_gemm(torch::Tensor xq,
   cublasLtMatrixLayoutDestroy(c_desc);
   cublasLtMatmulDescDestroy(op);
   return out;
+#else
+  TORCH_CHECK(false,
+              "mxfp8_gemm requires a cuBLAS >= 12.8 build (this variant has ",
+              CUBLAS_VERSION, "); use a cu128+ build for the Blackwell MXFP8 path");
+  return torch::Tensor();
+#endif
 }
 
 torch::Tensor mxfp8_linear(torch::Tensor x,
