@@ -47,22 +47,45 @@ def fp8_linear(x, wq, w_scale, bias=None):
     return ops.fp8_linear(x, wq, w_scale, bias)
 
 
+@torch.no_grad()
+def quantize_(module: nn.Module) -> int:
+    """In-place: quantize every eligible nn.Linear weight in `module` to e4m3.
+
+    The quantized weight replaces `linear.weight` (as a buffer) and the per-channel
+    scale is stored as `linear.weight_scale`. Run this ONCE before `kernelize()` so
+    the stateless `Fp8Linear` layer below never re-quantizes the weight per forward.
+    Returns the number of layers converted.
+    """
+    n = 0
+    for child in module.modules():
+        if (
+            isinstance(child, nn.Linear)
+            and child.in_features % 16 == 0
+            and getattr(child, "weight", None) is not None
+            and child.weight.dtype != torch.float8_e4m3fn
+        ):
+            wq, scale = quantize_weight(child.weight.data)
+            del child._parameters["weight"]
+            child.register_buffer("weight", wq)
+            child.register_buffer("weight_scale", scale)
+            n += 1
+    return n
+
+
 class Fp8Linear(nn.Module):
     """Stateless kernel layer: replaces an `nn.Linear`'s forward with an FP8 matmul.
 
-    Per the kernels layer contract this layer is pure -- it defines no constructor
-    and holds no state of its own. `kernelize()` grafts this `forward` onto an
-    existing `nn.Linear`, so it operates on that module's `weight`/`bias` (declared
-    below as type annotations, not class variables).
-
-    The weight is quantized to e4m3 per output channel on the fly and activations
-    are quantized per token by the fused kernel. If you have pre-quantized weights
-    (e4m3 `weight` + per-channel scale), call the `fp8_linear` op directly to skip
-    the per-call weight quantization.
+    Per the kernels layer contract this layer is pure -- no constructor, no state of
+    its own. `kernelize()` grafts this `forward` onto a module that has already been
+    quantized by `quantize_()`, so it reads a pre-quantized e4m3 `weight` and the
+    per-channel `weight_scale` from the host (declared below as type annotations).
+    Quantizing the weight once -- rather than per forward -- is what keeps the kernel
+    a net speedup; activations are still quantized per token by the fused op.
     """
 
-    # Member variables expected from the adopting nn.Linear (annotations only).
-    weight: torch.Tensor
+    # Member variables expected from the (quantized) host module.
+    weight: torch.Tensor  # e4m3 [N, K]
+    weight_scale: torch.Tensor  # fp32 [N]
     bias: torch.Tensor | None
 
     # Allowed class-variable exceptions to the no-state rule.
@@ -70,6 +93,5 @@ class Fp8Linear(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        wq, w_scale = quantize_weight(self.weight)
-        out = ops.fp8_linear(x, wq, w_scale, self.bias)
+        out = ops.fp8_linear(x, self.weight, self.weight_scale, self.bias)
         return out.to(x.dtype)

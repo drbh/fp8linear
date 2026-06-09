@@ -35,6 +35,7 @@ from PIL import Image
 from kernels import (
     LayerRepository,
     Mode,
+    get_kernel,
     kernelize,
     replace_kernel_forward_from_hub,
     use_kernel_mapping,
@@ -42,9 +43,12 @@ from kernels import (
 from huggingface_hub import HfApi
 from diffusers import FluxPipeline
 
+# Pull the kernel from the Hub for the one-time weight-quantization helper.
+fp8 = get_kernel("drbh/fp8linear", revision="v1")
+
 # Make nn.Linear extensible and map it to the kernel's stateless Fp8Linear layer.
-# kernelize() grafts the layer's forward onto each nn.Linear in place (keeping the
-# module's own weight/bias), pulling the kernel from the Hub.
+# kernelize() grafts the layer's forward onto each nn.Linear in place; the layer
+# reads the e4m3 weight + scale that fp8.quantize_() stored on the module.
 replace_kernel_forward_from_hub(nn.Linear, "Fp8Linear")
 FP8_MAPPING = {
     "Fp8Linear": {
@@ -73,18 +77,18 @@ def generate(use_kernel: bool) -> tuple[Image.Image, float]:
     )
     pipe.to("cuda")  # H200 has plenty of VRAM -> no CPU offload needed
     if use_kernel:
-        # Kernelize only the transformer blocks (the bulk of the compute); the
-        # embedders / output head stay bf16.
+        # Quantize the transformer-block weights to e4m3 ONCE (not per forward),
+        # then kernelize to graft the stateless FP8 forward. Embedders / output
+        # head stay bf16.
+        blocks = (
+            pipe.transformer.transformer_blocks,
+            pipe.transformer.single_transformer_blocks,
+        )
+        n = sum(fp8.quantize_(b) for b in blocks)
         with use_kernel_mapping(FP8_MAPPING):
-            kernelize(
-                pipe.transformer.transformer_blocks, mode=Mode.INFERENCE, device="cuda"
-            )
-            kernelize(
-                pipe.transformer.single_transformer_blocks,
-                mode=Mode.INFERENCE,
-                device="cuda",
-            )
-        print("  kernelized transformer blocks -> fp8linear:Fp8Linear")
+            for b in blocks:
+                kernelize(b, mode=Mode.INFERENCE, device="cuda")
+        print(f"  quantized + kernelized {n} Linear layers -> fp8linear:Fp8Linear")
 
     def run():
         return pipe(
