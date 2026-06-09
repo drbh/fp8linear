@@ -213,8 +213,10 @@ torch::Tensor fp8_linear(torch::Tensor x,
 // which is the overhead that caps the standard FP8 path on fast-bf16 GPUs.
 //
 // NOTE: requires sm_100+/sm_120 tensor cores to run; cannot be exercised on Ada.
-// The e8m0 scale-tensor layout cuBLASLt expects on Blackwell is the main thing to
-// validate on real hardware (we pass row-major [rows, K/32]).
+// Scale tensors are in cuBLASLt's tiled scale-factor layout (512-byte tiles of
+// 128 rows x 4 scale-cols, K-major tile order, padded grid) as produced by
+// quantize_mxfp8 -- a flat row-major layout here yields NaN garbage (verified
+// the hard way on an RTX PRO 6000).
 torch::Tensor mxfp8_gemm(torch::Tensor xq,
                          torch::Tensor x_scales,
                          torch::Tensor wq,
@@ -233,6 +235,17 @@ torch::Tensor mxfp8_gemm(torch::Tensor xq,
   auto ws = w_scales.contiguous();
   const int64_t M = xqc.size(0), K = xqc.size(1), N = wqc.size(0);
   TORCH_CHECK(K % 32 == 0, "K must be a multiple of 32 for MXFP8, got ", K);
+  // Scales must be in the tiled cuBLASLt layout from quantize_mxfp8: 512-byte
+  // tiles over a padded grid of ceil(rows/128) x ceil((K/32)/4).
+  const int64_t ncb = ((K / 32) + 3) / 4;
+  TORCH_CHECK(xs.scalar_type() == torch::kByte && ws.scalar_type() == torch::kByte,
+              "MX scales must be uint8 (e8m0)");
+  TORCH_CHECK(xs.numel() == ((M + 127) / 128) * ncb * 512,
+              "x_scales has wrong size for tiled MX layout (expected ",
+              ((M + 127) / 128) * ncb * 512, ", got ", xs.numel(), ")");
+  TORCH_CHECK(ws.numel() == ((N + 127) / 128) * ncb * 512,
+              "w_scales has wrong size for tiled MX layout (expected ",
+              ((N + 127) / 128) * ncb * 512, ", got ", ws.numel(), ")");
 
   auto out = torch::empty({M, N}, xqc.options().dtype(torch::kHalf));
   auto workspace = torch::empty(

@@ -70,14 +70,25 @@ __global__ void quant_rowwise_kernel(const scalar_t *__restrict__ x,
   }
 }
 
+// cuBLASLt block-scale-factor layout (Blackwell tcgen05): scales live in 512-byte
+// tiles covering 128 rows x 4 scale-columns. Within a tile, scale (r, c) sits at
+// (r%32)*16 + ((r%128)/32)*4 + (c%4); tiles are K-major (column-tile stride 512,
+// row-tile stride 512*ncb). `ncb` = ceil(nblk/4) column tiles. Row/col padding to
+// the tile grid is required; pad bytes are prefilled with 127 (scale = 1.0).
+__device__ __forceinline__ int64_t sf_offset(int64_t r, int64_t c, int64_t ncb) {
+  return (r >> 7) * (ncb * 512) + (c >> 2) * 512 + (r & 31) * 16 +
+         ((r & 127) >> 5) * 4 + (c & 3);
+}
+
 // MXFP8: per-32-element block quantization to e4m3 with a shared power-of-two
 // (e8m0) scale per block, the OCP microscaling format Blackwell tensor cores
 // consume natively. One block per row; each thread owns 32-element groups.
+// Scales are written directly in the tiled cuBLASLt layout described above.
 template <typename scalar_t>
 __global__ void quant_mxfp8_kernel(const scalar_t *__restrict__ x,
                                    __nv_fp8_storage_t *__restrict__ out,
                                    uint8_t *__restrict__ scales, int K,
-                                   int nblk) {
+                                   int nblk, int ncb) {
   const int64_t row = blockIdx.x;
   for (int g = threadIdx.x; g < nblk; g += blockDim.x) {
     const int64_t base = row * K + (int64_t)g * kMxBlock;
@@ -98,7 +109,7 @@ __global__ void quant_mxfp8_kernel(const scalar_t *__restrict__ x,
       e8 = 127;  // X = 1, values are zero anyway
       x_inv = 1.0f;
     }
-    scales[row * nblk + g] = (uint8_t)e8;
+    scales[sf_offset(row, g, ncb)] = (uint8_t)e8;
 #pragma unroll
     for (int i = 0; i < kMxBlock; ++i) {
       float q = static_cast<float>(x[base + i]) * x_inv;
@@ -148,7 +159,9 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_fp8(torch::Tensor x) {
   return {out, scale};
 }
 
-// Returns (xq[M,K] e4m3, scales[M, K/32] uint8/e8m0) in MXFP8 microscaling format.
+// Returns (xq[M,K] e4m3, scales uint8/e8m0) in MXFP8 microscaling format. The
+// scales tensor is 1-D, in cuBLASLt's tiled scale-factor layout padded to the
+// 128-row x 4-col tile grid: ceil(M/128) * ceil((K/32)/4) * 512 bytes.
 std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8(torch::Tensor x) {
   TORCH_CHECK(x.is_cuda(), "x must be on CUDA");
   TORCH_CHECK(x.scalar_type() == torch::kHalf ||
@@ -160,9 +173,13 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8(torch::Tensor x) {
   const int64_t K = xc.size(1);
   TORCH_CHECK(K % kMxBlock == 0, "K must be a multiple of 32 for MXFP8, got ", K);
   const int64_t nblk = K / kMxBlock;
+  const int64_t nrb = (M + 127) / 128;   // 128-row tiles
+  const int64_t ncb = (nblk + 3) / 4;    // 4-wide scale-column tiles
 
   auto out = torch::empty_like(xc, xc.options().dtype(torch::kFloat8_e4m3fn));
-  auto scales = torch::empty({M, nblk}, xc.options().dtype(torch::kByte));
+  // Prefill padding with 127 (e8m0 scale = 1.0); 0xFF would be NaN.
+  auto scales = torch::full({nrb * ncb * 512}, 127,
+                            xc.options().dtype(torch::kByte));
   if (M == 0)
     return {out, scales};
 
@@ -174,13 +191,14 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8(torch::Tensor x) {
                          quant_mxfp8_kernel<scalar_t><<<M, kThreads, 0, stream>>>(
                              xc.data_ptr<scalar_t>(),
                              reinterpret_cast<__nv_fp8_storage_t *>(out.data_ptr()),
-                             scales.data_ptr<uint8_t>(), (int)K, (int)nblk);
+                             scales.data_ptr<uint8_t>(), (int)K, (int)nblk,
+                             (int)ncb);
                        })
           AT_DISPATCH_CASE(torch::kBFloat16, [&] {
             quant_mxfp8_kernel<scalar_t><<<M, kThreads, 0, stream>>>(
                 xc.data_ptr<scalar_t>(),
                 reinterpret_cast<__nv_fp8_storage_t *>(out.data_ptr()),
-                scales.data_ptr<uint8_t>(), (int)K, (int)nblk);
+                scales.data_ptr<uint8_t>(), (int)K, (int)nblk, (int)ncb);
           }));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {out, scales};
@@ -195,10 +213,12 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_weight(torch::Tensor weight) {
   TORCH_CHECK(weight.is_cuda() && weight.dim() == 2, "weight must be a 2D CUDA tensor");
 
 #if CUBLAS_VERSION >= 120800
-  // MXFP8 only on Blackwell AND only in cu128+ builds (the MX matmul needs it).
+  // MXFP8 is OPT-IN (FP8LINEAR_USE_MX=1) on Blackwell: the cuBLASLt MX scale-factor
+  // layout is not yet validated -- on an RTX PRO 6000 it produced wrong output
+  // (PSNR ~8 dB) and no speedup. Default stays on the working per-channel FP8 path.
   const int major = at::cuda::getCurrentDeviceProperties()->major;
-  const bool force_fp8 = std::getenv("FP8LINEAR_NO_MX") != nullptr;
-  if (major >= 10 && !force_fp8) {
+  const bool use_mx = std::getenv("FP8LINEAR_USE_MX") != nullptr;
+  if (major >= 10 && use_mx) {
     auto w = (weight.scalar_type() == torch::kFloat) ? weight.to(torch::kBFloat16)
                                                      : weight;
     return quantize_mxfp8(w);

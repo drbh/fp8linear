@@ -30,7 +30,10 @@ def _fp8_gemm_fake(xq, x_scale, wq, w_scale, bias=None):
 @torch.library.register_fake(add_op_namespace_prefix("quantize_mxfp8"))
 def _quantize_mxfp8_fake(x):
     xq = x.new_empty(x.shape, dtype=torch.float8_e4m3fn)
-    scales = x.new_empty((x.shape[0], x.shape[1] // 32), dtype=torch.uint8)
+    # Tiled cuBLASLt scale layout: 512B tiles over ceil(M/128) x ceil((K/32)/4).
+    nrb = (x.shape[0] + 127) // 128
+    ncb = (x.shape[1] // 32 + 3) // 4
+    scales = x.new_empty((nrb * ncb * 512,), dtype=torch.uint8)
     return xq, scales
 
 
@@ -48,21 +51,15 @@ MX_BLOCK = 32
 
 
 def quantize_weight_mxfp8(weight: torch.Tensor):
-    """MXFP8 block-quantize a [N, K] weight to e4m3 + per-32 e8m0 scales (offline).
+    """MXFP8 block-quantize a [N, K] weight (offline) via the CUDA kernel.
 
-    Mirrors the CUDA `quantize_mxfp8` math so weights and activations share format.
-    Returns (wq[N,K] e4m3, scales[N, K/32] uint8/e8m0).
+    Returns (wq[N,K] e4m3, scales uint8/e8m0) with the scales already in the tiled
+    cuBLASLt scale-factor layout that `mxfp8_gemm` consumes.
     """
-    N, K = weight.shape
-    assert K % MX_BLOCK == 0, "K must be a multiple of 32 for MXFP8"
-    w = weight.detach().float().reshape(N, K // MX_BLOCK, MX_BLOCK)
-    amax = w.abs().amax(dim=-1)  # [N, K/32]
-    xexp = torch.floor(torch.log2(amax.clamp_min(1e-30))).to(torch.int32) - 8
-    e8 = (xexp + 127).clamp_(0, 254)
-    e8 = torch.where(amax > 0, e8, torch.full_like(e8, 127))
-    x_inv = torch.exp2(-(e8.float() - 127.0))  # [N, K/32]
-    wq = (w * x_inv[..., None]).clamp_(-E4M3_MAX, E4M3_MAX).reshape(N, K)
-    return wq.to(torch.float8_e4m3fn), e8.to(torch.uint8)
+    w = weight.detach()
+    if w.dtype not in (torch.float16, torch.bfloat16):
+        w = w.to(torch.bfloat16)
+    return ops.quantize_mxfp8(w.contiguous())
 
 
 def mxfp8_linear(x, wq, w_scales, bias=None):

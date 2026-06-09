@@ -9,9 +9,10 @@
 //   scale : scalar fp32 tensor (amax / 448)
 std::tuple<torch::Tensor, torch::Tensor> quantize_fp8(torch::Tensor x);
 
-// Arch-aware weight quantization (offline). Blackwell sm_100+ -> MXFP8 (e4m3 +
-// e8m0 [N,K/32] uint8 scales); else per-channel e4m3 + fp32 [N] scale. The scale
-// dtype tells fp8_linear which path to take. FP8LINEAR_NO_MX=1 forces per-channel.
+// Arch-aware weight quantization (offline). Default is per-channel e4m3 + fp32 [N]
+// scale (the validated path). On Blackwell sm_100+ with FP8LINEAR_USE_MX=1 it emits
+// MXFP8 (e4m3 + e8m0 [N,K/32] uint8 scales) instead -- experimental/unvalidated.
+// The returned scale dtype tells fp8_linear which path to take.
 std::tuple<torch::Tensor, torch::Tensor> quantize_weight(torch::Tensor weight);
 
 // FP8 matmul with per-tensor dequant scales, computed on tensor cores:
