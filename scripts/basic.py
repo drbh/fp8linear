@@ -67,8 +67,11 @@ OUT.mkdir(exist_ok=True)
 # Dataset to publish the generated samples to (override with FP8_SAMPLES_DATASET).
 DATASET_REPO = os.environ.get("FP8_SAMPLES_DATASET", "drbh/fp8linear-samples")
 PROMPT = "a photograph of an astronaut riding a horse on the moon, dramatic lighting"
-H = W = 512
-STEPS = 18
+# 1024px (seq ~4608) is FLUX's native resolution and where the FP8 GEMMs are
+# compute-bound enough to win. At 512px the matmuls are too small for FP8 to beat
+# H200's very fast bf16 (the same kernel is ~1.5x on a slower GPU like the 4090).
+H = W = int(os.environ.get("FP8_RES", "1024"))
+STEPS = int(os.environ.get("FP8_STEPS", "18"))
 SEED = 0
 
 
