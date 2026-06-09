@@ -44,6 +44,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "Tensor w_scales, "
           "Tensor? bias) -> Tensor");
   ops.impl("mxfp8_linear", torch::kCUDA, &mxfp8_linear);
+
+  // Blackwell (sm_100+/sm_120) NVFP4 path: e2m1 values, per-16 e4m3 scales.
+  ops.def("quantize_nvfp4(Tensor x) -> (Tensor, Tensor)");
+  ops.impl("quantize_nvfp4", torch::kCUDA, &quantize_nvfp4);
+
+  ops.def("nvfp4_gemm("
+          "Tensor xq, "
+          "Tensor x_scales, "
+          "Tensor wq, "
+          "Tensor w_scales, "
+          "Tensor? bias) -> Tensor");
+  ops.impl("nvfp4_gemm", torch::kCUDA, &nvfp4_gemm);
+
+  ops.def("nvfp4_linear("
+          "Tensor x, "
+          "Tensor wq, "
+          "Tensor w_scales, "
+          "Tensor? bias) -> Tensor");
+  ops.impl("nvfp4_linear", torch::kCUDA, &nvfp4_linear);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

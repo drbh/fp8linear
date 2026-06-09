@@ -16,6 +16,7 @@
 
 std::tuple<torch::Tensor, torch::Tensor> quantize_fp8(torch::Tensor x);
 std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8(torch::Tensor x);
+std::tuple<torch::Tensor, torch::Tensor> quantize_nvfp4(torch::Tensor x);
 std::tuple<torch::Tensor, torch::Tensor> quantize_weight(torch::Tensor weight);
 
 namespace {
@@ -129,6 +130,69 @@ __global__ void quant_mxfp8_kernel(const scalar_t *__restrict__ x,
   }
 }
 
+// ---- NVFP4 (e2m1 values, e4m3 scale per 16-element block) ----
+constexpr int kNvBlock = 16;
+
+// Round-to-nearest e2m1 nibble: sign<<3 | code, magnitudes {0,.5,1,1.5,2,3,4,6}.
+__device__ __forceinline__ uint8_t f2e2m1(float v) {
+  uint8_t s = v < 0.0f ? 8 : 0;
+  float a = fabsf(v);
+  uint8_t c;
+  if (a < 0.25f) c = 0;
+  else if (a < 0.75f) c = 1;
+  else if (a < 1.25f) c = 2;
+  else if (a < 1.75f) c = 3;
+  else if (a < 2.5f) c = 4;
+  else if (a < 3.5f) c = 5;
+  else if (a < 5.0f) c = 6;
+  else c = 7;
+  return s | c;
+}
+
+// One warp per PAIR of 16-element blocks (32 elements): lanes 0-15 own block A,
+// 16-31 block B. Coalesced loads; half-warp shuffle amax; block scale = e4m3
+// encoding of amax/6 (ue4m3 = positive e4m3 byte); even lanes pack two nibbles
+// per output byte. Scales land in the same tiled cuBLASLt layout (VEC16 -> the
+// scale-column count is K/16). Requires K % 32 == 0.
+template <typename scalar_t>
+__global__ void quant_nvfp4_kernel(const scalar_t *__restrict__ x,
+                                   uint8_t *__restrict__ out,
+                                   uint8_t *__restrict__ scales, int64_t M,
+                                   int K, int npair, int ncb) {
+  const int64_t total_pairs = M * (int64_t)npair;
+  const int warps_per_block = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  for (int64_t pi = (int64_t)blockIdx.x * warps_per_block + warp;
+       pi < total_pairs; pi += (int64_t)gridDim.x * warps_per_block) {
+    const int64_t row = pi / npair;
+    const int pair = (int)(pi % npair);
+    const int64_t base = row * K + (int64_t)pair * 32;
+    const float val = static_cast<float>(x[base + lane]);
+
+    // amax within each 16-lane half (xor offsets <= 8 stay in the half)
+    float amax = fabsf(val);
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1)
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+
+    // e4m3-encoded block scale = amax / 6 (clamped into e4m3 range)
+    float s = fminf(amax * (1.0f / 6.0f), kE4M3Max);
+    __nv_fp8_storage_t s8 = __nv_cvt_float_to_fp8(s, __NV_SATFINITE, __NV_E4M3);
+    float sdec = __half2float(__nv_cvt_fp8_to_halfraw(s8, __NV_E4M3));
+    float x_inv = sdec > 0.0f ? 1.0f / sdec : 0.0f;
+
+    const int g = pair * 2 + (lane >> 4);  // scale column (16-element blocks)
+    if ((lane & 15) == 0)
+      scales[sf_offset(row, g, ncb)] = (uint8_t)s8;
+
+    uint8_t nib = f2e2m1(fminf(fmaxf(val * x_inv, -6.0f), 6.0f));
+    uint8_t hi = __shfl_down_sync(0xffffffff, nib, 1);
+    if ((lane & 1) == 0)
+      out[(base + lane) >> 1] = (uint8_t)(nib | (hi << 4));
+  }
+}
+
 } // namespace
 
 // Returns (xq[M,K] e4m3, x_scale[M] fp32) with x[m] ~= xq[m] * x_scale[m].
@@ -220,6 +284,55 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8(torch::Tensor x) {
   return {out, scales};
 }
 
+// Returns (xq[M, K/2] uint8 with two e2m1 nibbles per byte, scales uint8/e4m3) in
+// NVFP4 format. Scales are 1-D in the tiled cuBLASLt scale-factor layout over a
+// padded grid of ceil(M/128) x ceil((K/16)/4) 512-byte tiles.
+std::tuple<torch::Tensor, torch::Tensor> quantize_nvfp4(torch::Tensor x) {
+  TORCH_CHECK(x.is_cuda(), "x must be on CUDA");
+  TORCH_CHECK(x.scalar_type() == torch::kHalf ||
+                  x.scalar_type() == torch::kBFloat16,
+              "x must be fp16 or bf16");
+  TORCH_CHECK(x.dim() == 2, "x must be 2D [M, K]");
+  auto xc = x.contiguous();
+  const int64_t M = xc.size(0);
+  const int64_t K = xc.size(1);
+  TORCH_CHECK(K % 32 == 0, "K must be a multiple of 32 for NVFP4, got ", K);
+  const int64_t nblk = K / kNvBlock;     // 16-element blocks (scale columns)
+  const int64_t npair = K / 32;          // block pairs (one warp each)
+  const int64_t nrb = (M + 127) / 128;
+  const int64_t ncb = (nblk + 3) / 4;
+
+  auto out = torch::empty({M, K / 2}, xc.options().dtype(torch::kByte));
+  // Pad byte 0x38 = e4m3 1.0 (any finite value works; padding is never read).
+  auto scales = torch::full({nrb * ncb * 512}, 0x38,
+                            xc.options().dtype(torch::kByte));
+  if (M == 0)
+    return {out, scales};
+
+  const int64_t total_pairs = M * npair;
+  const int warps_per_block = kThreads / 32;
+  const int blocks = (int)std::min<int64_t>(
+      (total_pairs + warps_per_block - 1) / warps_per_block, 32768);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_SWITCH(
+      xc.scalar_type(), "quantize_nvfp4",
+      AT_DISPATCH_CASE(torch::kHalf,
+                       [&] {
+                         quant_nvfp4_kernel<scalar_t><<<blocks, kThreads, 0, stream>>>(
+                             xc.data_ptr<scalar_t>(), out.data_ptr<uint8_t>(),
+                             scales.data_ptr<uint8_t>(), M, (int)K, (int)npair,
+                             (int)ncb);
+                       })
+          AT_DISPATCH_CASE(torch::kBFloat16, [&] {
+            quant_nvfp4_kernel<scalar_t><<<blocks, kThreads, 0, stream>>>(
+                xc.data_ptr<scalar_t>(), out.data_ptr<uint8_t>(),
+                scales.data_ptr<uint8_t>(), M, (int)K, (int)npair, (int)ncb);
+          }));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {out, scales};
+}
+
 // Arch-aware weight quantization (run once, offline). On Blackwell (sm_100+) it
 // emits MXFP8 (e4m3 + e8m0 block scales) so fp8_linear takes the native block-
 // scaled path; otherwise per-channel e4m3 + fp32 scale. The returned scale's dtype
@@ -229,15 +342,17 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_weight(torch::Tensor weight) {
   TORCH_CHECK(weight.is_cuda() && weight.dim() == 2, "weight must be a 2D CUDA tensor");
 
 #if CUBLAS_VERSION >= 120800
-  // MXFP8 is OPT-IN (FP8LINEAR_USE_MX=1) on Blackwell: the cuBLASLt MX scale-factor
-  // layout is not yet validated -- on an RTX PRO 6000 it produced wrong output
-  // (PSNR ~8 dB) and no speedup. Default stays on the working per-channel FP8 path.
+  // Block-scaled paths are OPT-IN on Blackwell (sm_100+); the default stays on the
+  // validated per-channel FP8 path. FP8LINEAR_USE_NVFP4=1 -> e2m1 weights with
+  // per-16 e4m3 scales (2x FP8 tensor rate); FP8LINEAR_USE_MX=1 -> MXFP8.
   const int major = at::cuda::getCurrentDeviceProperties()->major;
-  const bool use_mx = std::getenv("FP8LINEAR_USE_MX") != nullptr;
-  if (major >= 10 && use_mx) {
+  if (major >= 10) {
     auto w = (weight.scalar_type() == torch::kFloat) ? weight.to(torch::kBFloat16)
                                                      : weight;
-    return quantize_mxfp8(w);
+    if (std::getenv("FP8LINEAR_USE_NVFP4") != nullptr)
+      return quantize_nvfp4(w);
+    if (std::getenv("FP8LINEAR_USE_MX") != nullptr)
+      return quantize_mxfp8(w);
   }
 #endif
 

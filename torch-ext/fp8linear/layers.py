@@ -47,6 +47,25 @@ def _mxfp8_linear_fake(x, wq, w_scales, bias=None):
     return x.new_empty((*x.shape[:-1], wq.shape[0]), dtype=torch.float16)
 
 
+@torch.library.register_fake(add_op_namespace_prefix("quantize_nvfp4"))
+def _quantize_nvfp4_fake(x):
+    xq = x.new_empty((x.shape[0], x.shape[1] // 2), dtype=torch.uint8)
+    nrb = (x.shape[0] + 127) // 128
+    ncb = (x.shape[1] // 16 + 3) // 4
+    scales = x.new_empty((nrb * ncb * 512,), dtype=torch.uint8)
+    return xq, scales
+
+
+@torch.library.register_fake(add_op_namespace_prefix("nvfp4_gemm"))
+def _nvfp4_gemm_fake(xq, x_scales, wq, w_scales, bias=None):
+    return xq.new_empty((xq.shape[0], wq.shape[0]), dtype=torch.float16)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("nvfp4_linear"))
+def _nvfp4_linear_fake(x, wq, w_scales, bias=None):
+    return x.new_empty((*x.shape[:-1], wq.shape[0]), dtype=torch.float16)
+
+
 MX_BLOCK = 32
 
 
@@ -65,6 +84,23 @@ def quantize_weight_mxfp8(weight: torch.Tensor):
 def mxfp8_linear(x, wq, w_scales, bias=None):
     """MXFP8 linear (Blackwell sm_120+). `wq`/`w_scales` from quantize_weight_mxfp8."""
     return ops.mxfp8_linear(x, wq, w_scales, bias)
+
+
+def quantize_weight_nvfp4(weight: torch.Tensor):
+    """NVFP4 block-quantize a [N, K] weight (offline) via the CUDA kernel.
+
+    Returns (wq[N, K/2] packed e2m1 uint8, scales uint8/e4m3 in the tiled cuBLASLt
+    layout) for `nvfp4_gemm`/`nvfp4_linear`.
+    """
+    w = weight.detach()
+    if w.dtype not in (torch.float16, torch.bfloat16):
+        w = w.to(torch.bfloat16)
+    return ops.quantize_nvfp4(w.contiguous())
+
+
+def nvfp4_linear(x, wq, w_scales, bias=None):
+    """NVFP4 linear (Blackwell sm_100+). `wq`/`w_scales` from quantize_weight_nvfp4."""
+    return ops.nvfp4_linear(x, wq, w_scales, bias)
 
 
 def quantize_weight(weight: torch.Tensor):

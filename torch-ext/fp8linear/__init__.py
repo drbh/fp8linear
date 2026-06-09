@@ -4,15 +4,19 @@ from .layers import (
     Fp8Linear,
     fp8_linear,
     mxfp8_linear,
+    nvfp4_linear,
     quantize_,
     quantize_weight,
     quantize_weight_mxfp8,
+    quantize_weight_nvfp4,
 )
 
 quantize_fp8 = ops.quantize_fp8
 fp8_gemm = ops.fp8_gemm
 quantize_mxfp8 = ops.quantize_mxfp8
 mxfp8_gemm = ops.mxfp8_gemm
+quantize_nvfp4 = ops.quantize_nvfp4
+nvfp4_gemm = ops.nvfp4_gemm
 
 __all__ = [
     "ops",
@@ -28,4 +32,9 @@ __all__ = [
     "quantize_weight_mxfp8",
     "quantize_mxfp8",
     "mxfp8_gemm",
+    # Blackwell NVFP4 path
+    "nvfp4_linear",
+    "quantize_weight_nvfp4",
+    "quantize_nvfp4",
+    "nvfp4_gemm",
 ]

@@ -1,25 +1,23 @@
-name: Run kernel
+name: NVFP4 check
 
 on:
   workflow_dispatch:
 
 jobs:
-  run:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run basic.py on an HF Jobs H200 GPU
+      - name: Run nvfp4_check.py on an HF Jobs RTX PRO 6000
         uses: huggingface/hf-jobs-action@main
         with:
           token: ${{ secrets.HF_TOKEN }}
           namespace: drbh
-          # flavor: h200
           flavor: rtx-pro-6000
           image: ghcr.io/astral-sh/uv:python3.10-bookworm
-          timeout: "3600"
-          files: scripts/basic.py
+          timeout: "1800"
+          files: scripts/nvfp4_check.py
           script: |
             set +x
             export HF_TOKEN="${{ secrets.HF_TOKEN }}"
-            export FP8LINEAR_USE_NVFP4=1
-            uv run /tmp/files/basic.py
+            uv run /tmp/files/nvfp4_check.py

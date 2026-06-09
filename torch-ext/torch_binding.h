@@ -61,3 +61,23 @@ torch::Tensor mxfp8_linear(torch::Tensor x,
                            torch::Tensor wq,
                            torch::Tensor w_scales,
                            std::optional<torch::Tensor> bias);
+
+// ===== Blackwell NVFP4 path (e2m1 values, e4m3 scale per 16-element block) =====
+// 2x the FP8 tensor-core rate on sm_100+/sm_120. Values are packed two-per-byte;
+// scales use the same tiled cuBLASLt layout (scale-column count K/16).
+
+// Returns (xq[M, K/2] uint8 packed e2m1, scales uint8/e4m3, tiled+padded).
+std::tuple<torch::Tensor, torch::Tensor> quantize_nvfp4(torch::Tensor x);
+
+// out[M,N] = (xq @ wq^T) with per-16 e4m3 dequant applied in-core, fp16 out.
+torch::Tensor nvfp4_gemm(torch::Tensor xq,
+                         torch::Tensor x_scales,
+                         torch::Tensor wq,
+                         torch::Tensor w_scales,
+                         std::optional<torch::Tensor> bias);
+
+// Fused NVFP4 linear: dynamic block-scaled quant of x, then nvfp4_gemm.
+torch::Tensor nvfp4_linear(torch::Tensor x,
+                           torch::Tensor wq,
+                           torch::Tensor w_scales,
+                           std::optional<torch::Tensor> bias);
