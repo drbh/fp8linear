@@ -32,12 +32,30 @@ import numpy as np
 import torch
 from torch import nn
 from PIL import Image
-from kernels import get_kernel
+from kernels import (
+    LayerRepository,
+    Mode,
+    kernelize,
+    replace_kernel_forward_from_hub,
+    use_kernel_mapping,
+)
 from huggingface_hub import HfApi
 from diffusers import FluxPipeline
 
-# Pull the fp8linear kernel from the Hub.
-fp8 = get_kernel("drbh/fp8linear", revision="v1")
+# Make nn.Linear extensible and map it to the kernel's stateless Fp8Linear layer.
+# kernelize() grafts the layer's forward onto each nn.Linear in place (keeping the
+# module's own weight/bias), pulling the kernel from the Hub.
+replace_kernel_forward_from_hub(nn.Linear, "Fp8Linear")
+FP8_MAPPING = {
+    "Fp8Linear": {
+        "cuda": LayerRepository(
+            repo_id="drbh/fp8linear",
+            revision="v1",
+            layer_name="Fp8Linear",
+            trust_remote_code=True,
+        )
+    }
+}
 
 OUT = Path(__file__).resolve().parent.parent / "basic_out"
 OUT.mkdir(exist_ok=True)
@@ -49,44 +67,24 @@ STEPS = 18
 SEED = 0
 
 
-class Fp8Linear(nn.Module):
-    """nn.Linear replacement backed by the Hub fp8linear kernel."""
-
-    def __init__(self, lin: nn.Linear):
-        super().__init__()
-        wq, w_scale = fp8.quantize_weight(lin.weight.data.to("cuda"))
-        self.register_buffer("wq", wq)
-        self.register_buffer("w_scale", w_scale)
-        self.register_buffer(
-            "bias", lin.bias.data.to(torch.float16) if lin.bias is not None else None
-        )
-
-    def forward(self, x):
-        return fp8.ops.fp8_linear(x, self.wq, self.w_scale, self.bias).to(x.dtype)
-
-
-def swap_linears(module: nn.Module) -> int:
-    n = 0
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear) and child.in_features % 16 == 0:
-            setattr(module, name, Fp8Linear(child))
-            n += 1
-        else:
-            n += swap_linears(child)
-    return n
-
-
 def generate(use_kernel: bool) -> tuple[Image.Image, float]:
     pipe = FluxPipeline.from_pretrained(
         "black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16
     )
-    if use_kernel:
-        # swap the transformer-block linears (the bulk) for the FP8 kernel
-        n = swap_linears(pipe.transformer.transformer_blocks)
-        n += swap_linears(pipe.transformer.single_transformer_blocks)
-        print(f"  swapped {n} Linear layers -> fp8linear")
-        torch.cuda.empty_cache()
     pipe.to("cuda")  # H200 has plenty of VRAM -> no CPU offload needed
+    if use_kernel:
+        # Kernelize only the transformer blocks (the bulk of the compute); the
+        # embedders / output head stay bf16.
+        with use_kernel_mapping(FP8_MAPPING):
+            kernelize(
+                pipe.transformer.transformer_blocks, mode=Mode.INFERENCE, device="cuda"
+            )
+            kernelize(
+                pipe.transformer.single_transformer_blocks,
+                mode=Mode.INFERENCE,
+                device="cuda",
+            )
+        print("  kernelized transformer blocks -> fp8linear:Fp8Linear")
 
     def run():
         return pipe(
