@@ -27,19 +27,56 @@ def _fp8_gemm_fake(xq, x_scale, wq, w_scale, bias=None):
     return xq.new_empty((xq.shape[0], wq.shape[0]), dtype=torch.float16)
 
 
-def quantize_weight(weight: torch.Tensor):
-    """Per-channel (per-output-row) quantize a [N, K] weight to e4m3.
+@torch.library.register_fake(add_op_namespace_prefix("quantize_mxfp8"))
+def _quantize_mxfp8_fake(x):
+    xq = x.new_empty(x.shape, dtype=torch.float8_e4m3fn)
+    scales = x.new_empty((x.shape[0], x.shape[1] // 32), dtype=torch.uint8)
+    return xq, scales
 
-    Returns (wq, w_scale) with weight[n] ~= wq[n] * w_scale[n]; w_scale is [N] fp32.
+
+@torch.library.register_fake(add_op_namespace_prefix("mxfp8_gemm"))
+def _mxfp8_gemm_fake(xq, x_scales, wq, w_scales, bias=None):
+    return xq.new_empty((xq.shape[0], wq.shape[0]), dtype=torch.float16)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("mxfp8_linear"))
+def _mxfp8_linear_fake(x, wq, w_scales, bias=None):
+    return x.new_empty((*x.shape[:-1], wq.shape[0]), dtype=torch.float16)
+
+
+MX_BLOCK = 32
+
+
+def quantize_weight_mxfp8(weight: torch.Tensor):
+    """MXFP8 block-quantize a [N, K] weight to e4m3 + per-32 e8m0 scales (offline).
+
+    Mirrors the CUDA `quantize_mxfp8` math so weights and activations share format.
+    Returns (wq[N,K] e4m3, scales[N, K/32] uint8/e8m0).
     """
-    amax = weight.detach().abs().amax(dim=1).float()  # [N]
-    scale = (amax / E4M3_MAX).clamp_min(1e-12)  # [N]
-    wq = (
-        (weight.float() / scale[:, None])
-        .clamp_(-E4M3_MAX, E4M3_MAX)
-        .to(torch.float8_e4m3fn)
-    )
-    return wq, scale
+    N, K = weight.shape
+    assert K % MX_BLOCK == 0, "K must be a multiple of 32 for MXFP8"
+    w = weight.detach().float().reshape(N, K // MX_BLOCK, MX_BLOCK)
+    amax = w.abs().amax(dim=-1)  # [N, K/32]
+    xexp = torch.floor(torch.log2(amax.clamp_min(1e-30))).to(torch.int32) - 8
+    e8 = (xexp + 127).clamp_(0, 254)
+    e8 = torch.where(amax > 0, e8, torch.full_like(e8, 127))
+    x_inv = torch.exp2(-(e8.float() - 127.0))  # [N, K/32]
+    wq = (w * x_inv[..., None]).clamp_(-E4M3_MAX, E4M3_MAX).reshape(N, K)
+    return wq.to(torch.float8_e4m3fn), e8.to(torch.uint8)
+
+
+def mxfp8_linear(x, wq, w_scales, bias=None):
+    """MXFP8 linear (Blackwell sm_120+). `wq`/`w_scales` from quantize_weight_mxfp8."""
+    return ops.mxfp8_linear(x, wq, w_scales, bias)
+
+
+def quantize_weight(weight: torch.Tensor):
+    """Arch-aware weight quantization (the choice lives in C++ `ops.quantize_weight`).
+
+    Returns (wq, w_scale). On Blackwell (sm_100+) w_scale is uint8/e8m0 block scales
+    (MXFP8); otherwise fp32 per-channel scales. `fp8_linear` dispatches on that dtype.
+    """
+    return ops.quantize_weight(weight)
 
 
 def fp8_linear(x, wq, w_scale, bias=None):

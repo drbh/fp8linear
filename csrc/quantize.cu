@@ -8,15 +8,19 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cstdlib>
 #include <cuda_fp8.h>
 #include <torch/torch.h>
 
 std::tuple<torch::Tensor, torch::Tensor> quantize_fp8(torch::Tensor x);
+std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8(torch::Tensor x);
+std::tuple<torch::Tensor, torch::Tensor> quantize_weight(torch::Tensor weight);
 
 namespace {
 
 constexpr float kE4M3Max = 448.0f;
 constexpr int kThreads = 256;
+constexpr int kMxBlock = 32;  // MXFP8 block size (OCP microscaling)
 
 __device__ __forceinline__ float block_reduce_max(float v) {
   __shared__ float s[kThreads / 32];
@@ -65,6 +69,44 @@ __global__ void quant_rowwise_kernel(const scalar_t *__restrict__ x,
   }
 }
 
+// MXFP8: per-32-element block quantization to e4m3 with a shared power-of-two
+// (e8m0) scale per block, the OCP microscaling format Blackwell tensor cores
+// consume natively. One block per row; each thread owns 32-element groups.
+template <typename scalar_t>
+__global__ void quant_mxfp8_kernel(const scalar_t *__restrict__ x,
+                                   __nv_fp8_storage_t *__restrict__ out,
+                                   uint8_t *__restrict__ scales, int K,
+                                   int nblk) {
+  const int64_t row = blockIdx.x;
+  for (int g = threadIdx.x; g < nblk; g += blockDim.x) {
+    const int64_t base = row * K + (int64_t)g * kMxBlock;
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kMxBlock; ++i)
+      amax = fmaxf(amax, fabsf(static_cast<float>(x[base + i])));
+
+    int e8;       // biased (bias 127) exponent of the block scale X = 2^(Xexp)
+    float x_inv;  // 1 / X, maps the block into e4m3 range
+    if (amax > 0.0f) {
+      // X = 2^(floor(log2(amax)) - 8); e4m3 max normal exponent is 8.
+      int xexp = (int)floorf(log2f(amax)) - 8;
+      e8 = xexp + 127;
+      e8 = e8 < 0 ? 0 : (e8 > 254 ? 254 : e8);
+      x_inv = exp2f(-(float)(e8 - 127));
+    } else {
+      e8 = 127;  // X = 1, values are zero anyway
+      x_inv = 1.0f;
+    }
+    scales[row * nblk + g] = (uint8_t)e8;
+#pragma unroll
+    for (int i = 0; i < kMxBlock; ++i) {
+      float q = static_cast<float>(x[base + i]) * x_inv;
+      q = fminf(fmaxf(q, -kE4M3Max), kE4M3Max);
+      out[base + i] = __nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+    }
+  }
+}
+
 } // namespace
 
 // Returns (xq[M,K] e4m3, x_scale[M] fp32) with x[m] ~= xq[m] * x_scale[m].
@@ -103,4 +145,67 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_fp8(torch::Tensor x) {
           }));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {out, scale};
+}
+
+// Returns (xq[M,K] e4m3, scales[M, K/32] uint8/e8m0) in MXFP8 microscaling format.
+std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8(torch::Tensor x) {
+  TORCH_CHECK(x.is_cuda(), "x must be on CUDA");
+  TORCH_CHECK(x.scalar_type() == torch::kHalf ||
+                  x.scalar_type() == torch::kBFloat16,
+              "x must be fp16 or bf16");
+  TORCH_CHECK(x.dim() == 2, "x must be 2D [M, K]");
+  auto xc = x.contiguous();
+  const int64_t M = xc.size(0);
+  const int64_t K = xc.size(1);
+  TORCH_CHECK(K % kMxBlock == 0, "K must be a multiple of 32 for MXFP8, got ", K);
+  const int64_t nblk = K / kMxBlock;
+
+  auto out = torch::empty_like(xc, xc.options().dtype(torch::kFloat8_e4m3fn));
+  auto scales = torch::empty({M, nblk}, xc.options().dtype(torch::kByte));
+  if (M == 0)
+    return {out, scales};
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_SWITCH(
+      xc.scalar_type(), "quantize_mxfp8",
+      AT_DISPATCH_CASE(torch::kHalf,
+                       [&] {
+                         quant_mxfp8_kernel<scalar_t><<<M, kThreads, 0, stream>>>(
+                             xc.data_ptr<scalar_t>(),
+                             reinterpret_cast<__nv_fp8_storage_t *>(out.data_ptr()),
+                             scales.data_ptr<uint8_t>(), (int)K, (int)nblk);
+                       })
+          AT_DISPATCH_CASE(torch::kBFloat16, [&] {
+            quant_mxfp8_kernel<scalar_t><<<M, kThreads, 0, stream>>>(
+                xc.data_ptr<scalar_t>(),
+                reinterpret_cast<__nv_fp8_storage_t *>(out.data_ptr()),
+                scales.data_ptr<uint8_t>(), (int)K, (int)nblk);
+          }));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {out, scales};
+}
+
+// Arch-aware weight quantization (run once, offline). On Blackwell (sm_100+) it
+// emits MXFP8 (e4m3 + e8m0 block scales) so fp8_linear takes the native block-
+// scaled path; otherwise per-channel e4m3 + fp32 scale. The returned scale's dtype
+// (uint8 vs fp32) is what fp8_linear later dispatches on. Set FP8LINEAR_NO_MX=1 to
+// force the per-channel path even on Blackwell (escape hatch while MX is validated).
+std::tuple<torch::Tensor, torch::Tensor> quantize_weight(torch::Tensor weight) {
+  TORCH_CHECK(weight.is_cuda() && weight.dim() == 2, "weight must be a 2D CUDA tensor");
+  const int major = at::cuda::getCurrentDeviceProperties()->major;
+  const bool force_fp8 = std::getenv("FP8LINEAR_NO_MX") != nullptr;
+
+  if (major >= 10 && !force_fp8) {
+    auto w = (weight.scalar_type() == torch::kFloat) ? weight.to(torch::kBFloat16)
+                                                     : weight;
+    return quantize_mxfp8(w);
+  }
+
+  // Per-channel (per-output-row) e4m3.
+  auto amax = weight.detach().abs().amax(1).to(torch::kFloat);
+  auto scale = (amax / kE4M3Max).clamp_min(1e-12);
+  auto wq = (weight.to(torch::kFloat) / scale.unsqueeze(1))
+                .clamp(-kE4M3Max, kE4M3Max)
+                .to(torch::kFloat8_e4m3fn);
+  return {wq, scale};
 }

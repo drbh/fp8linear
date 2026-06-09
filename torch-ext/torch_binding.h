@@ -9,6 +9,11 @@
 //   scale : scalar fp32 tensor (amax / 448)
 std::tuple<torch::Tensor, torch::Tensor> quantize_fp8(torch::Tensor x);
 
+// Arch-aware weight quantization (offline). Blackwell sm_100+ -> MXFP8 (e4m3 +
+// e8m0 [N,K/32] uint8 scales); else per-channel e4m3 + fp32 [N] scale. The scale
+// dtype tells fp8_linear which path to take. FP8LINEAR_NO_MX=1 forces per-channel.
+std::tuple<torch::Tensor, torch::Tensor> quantize_weight(torch::Tensor weight);
+
 // FP8 matmul with per-tensor dequant scales, computed on tensor cores:
 //   out[M, N] = (xq @ wq^T) * x_scale * w_scale (+ bias)
 //   xq      : [M, K] float8_e4m3fn, row-major
@@ -34,3 +39,24 @@ torch::Tensor fp8_linear(torch::Tensor x,
                          torch::Tensor wq,
                          torch::Tensor w_scale,
                          std::optional<torch::Tensor> bias);
+
+// ===== Blackwell (sm_120) MXFP8 microscaling path =====
+// Block-scaled FP8 consumed natively by Blackwell tensor cores: e8m0 scale per
+// 32-element block, applied in-matmul -> fp16 direct, no dequant epilogue.
+
+// Returns (xq[M,K] e4m3, scales[M, K/32] uint8/e8m0).
+std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8(torch::Tensor x);
+
+// out[M,N] = (xq @ wq^T) with per-32-block e8m0 dequant applied in-core, fp16 out.
+//   x_scales : [M, K/32] uint8 (e8m0)   w_scales : [N, K/32] uint8 (e8m0)
+torch::Tensor mxfp8_gemm(torch::Tensor xq,
+                         torch::Tensor x_scales,
+                         torch::Tensor wq,
+                         torch::Tensor w_scales,
+                         std::optional<torch::Tensor> bias);
+
+// Fused MXFP8 linear: dynamic block-scaled quant of x, then mxfp8_gemm.
+torch::Tensor mxfp8_linear(torch::Tensor x,
+                           torch::Tensor wq,
+                           torch::Tensor w_scales,
+                           std::optional<torch::Tensor> bias);
