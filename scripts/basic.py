@@ -44,7 +44,8 @@ from huggingface_hub import HfApi
 from diffusers import FluxPipeline
 
 # Pull the kernel from the Hub for the one-time weight-quantization helper.
-fp8 = get_kernel("drbh/fp8linear", revision="v1")
+# trust_remote_code=True: drbh is not a default-trusted publisher.
+fp8 = get_kernel("drbh/fp8linear", revision="v1", trust_remote_code=True)
 
 # Make nn.Linear extensible and map it to the kernel's stateless Fp8Linear layer.
 # kernelize() grafts the layer's forward onto each nn.Linear in place; the layer
