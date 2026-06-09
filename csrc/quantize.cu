@@ -8,6 +8,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
+#include <algorithm>
 #include <cstdlib>
 #include <cublas_v2.h>  // for CUBLAS_VERSION (MX path gated to cuBLAS >= 12.8)
 #include <cuda_fp8.h>
@@ -82,20 +83,30 @@ __device__ __forceinline__ int64_t sf_offset(int64_t r, int64_t c, int64_t ncb) 
 
 // MXFP8: per-32-element block quantization to e4m3 with a shared power-of-two
 // (e8m0) scale per block, the OCP microscaling format Blackwell tensor cores
-// consume natively. One block per row; each thread owns 32-element groups.
+// consume natively. One WARP per 32-element group: lane l owns element l, so
+// loads/stores are fully coalesced and the block amax is a warp-shuffle
+// reduction. (The previous thread-per-group serial loop was 5-10x slower than
+// the rowwise fp8 quantizer and erased the MX matmul win on large-K shapes.)
 // Scales are written directly in the tiled cuBLASLt layout described above.
 template <typename scalar_t>
 __global__ void quant_mxfp8_kernel(const scalar_t *__restrict__ x,
                                    __nv_fp8_storage_t *__restrict__ out,
-                                   uint8_t *__restrict__ scales, int K,
-                                   int nblk, int ncb) {
-  const int64_t row = blockIdx.x;
-  for (int g = threadIdx.x; g < nblk; g += blockDim.x) {
-    const int64_t base = row * K + (int64_t)g * kMxBlock;
-    float amax = 0.0f;
+                                   uint8_t *__restrict__ scales, int64_t M,
+                                   int K, int nblk, int ncb) {
+  const int64_t total_groups = M * (int64_t)nblk;
+  const int warps_per_block = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  for (int64_t gi = (int64_t)blockIdx.x * warps_per_block + warp;
+       gi < total_groups; gi += (int64_t)gridDim.x * warps_per_block) {
+    const int64_t row = gi / nblk;
+    const int g = (int)(gi % nblk);
+    const float val = static_cast<float>(x[row * K + (int64_t)g * kMxBlock + lane]);
+
+    float amax = fabsf(val);
 #pragma unroll
-    for (int i = 0; i < kMxBlock; ++i)
-      amax = fmaxf(amax, fabsf(static_cast<float>(x[base + i])));
+    for (int o = 16; o > 0; o >>= 1)
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
 
     int e8;       // biased (bias 127) exponent of the block scale X = 2^(Xexp)
     float x_inv;  // 1 / X, maps the block into e4m3 range
@@ -109,13 +120,12 @@ __global__ void quant_mxfp8_kernel(const scalar_t *__restrict__ x,
       e8 = 127;  // X = 1, values are zero anyway
       x_inv = 1.0f;
     }
-    scales[sf_offset(row, g, ncb)] = (uint8_t)e8;
-#pragma unroll
-    for (int i = 0; i < kMxBlock; ++i) {
-      float q = static_cast<float>(x[base + i]) * x_inv;
-      q = fminf(fmaxf(q, -kE4M3Max), kE4M3Max);
-      out[base + i] = __nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
-    }
+    if (lane == 0)
+      scales[sf_offset(row, g, ncb)] = (uint8_t)e8;
+
+    float q = fminf(fmaxf(val * x_inv, -kE4M3Max), kE4M3Max);
+    out[row * K + (int64_t)g * kMxBlock + lane] =
+        __nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
   }
 }
 
@@ -183,22 +193,28 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8(torch::Tensor x) {
   if (M == 0)
     return {out, scales};
 
+  // One warp per 32-element group, grid-stride over all groups.
+  const int64_t total_groups = M * nblk;
+  const int warps_per_block = kThreads / 32;
+  const int blocks = (int)std::min<int64_t>(
+      (total_groups + warps_per_block - 1) / warps_per_block, 32768);
+
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_SWITCH(
       xc.scalar_type(), "quantize_mxfp8",
       AT_DISPATCH_CASE(torch::kHalf,
                        [&] {
-                         quant_mxfp8_kernel<scalar_t><<<M, kThreads, 0, stream>>>(
+                         quant_mxfp8_kernel<scalar_t><<<blocks, kThreads, 0, stream>>>(
                              xc.data_ptr<scalar_t>(),
                              reinterpret_cast<__nv_fp8_storage_t *>(out.data_ptr()),
-                             scales.data_ptr<uint8_t>(), (int)K, (int)nblk,
+                             scales.data_ptr<uint8_t>(), M, (int)K, (int)nblk,
                              (int)ncb);
                        })
           AT_DISPATCH_CASE(torch::kBFloat16, [&] {
-            quant_mxfp8_kernel<scalar_t><<<M, kThreads, 0, stream>>>(
+            quant_mxfp8_kernel<scalar_t><<<blocks, kThreads, 0, stream>>>(
                 xc.data_ptr<scalar_t>(),
                 reinterpret_cast<__nv_fp8_storage_t *>(out.data_ptr()),
-                scales.data_ptr<uint8_t>(), (int)K, (int)nblk, (int)ncb);
+                scales.data_ptr<uint8_t>(), M, (int)K, (int)nblk, (int)ncb);
           }));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {out, scales};
