@@ -1,0 +1,49 @@
+name: Build Kernel
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "csrc/**"
+      - "torch-ext/**"
+      - build.toml
+      - flake.nix
+      - flake.lock
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Hub branch to upload the build"
+        default: v1
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build kernel via HF Jobs and upload to drbh/fp8linear
+        uses: huggingface/kernel-builder-job@main
+        with:
+          token: ${{ secrets.HF_TOKEN }}
+          namespace: drbh
+          flavor: cpu-xl
+          timeout: "21600"
+          # image: uses default nix image
+          script: |
+            # The HF Jobs container is started with `set -x`, which would echo
+            # the token below into the streamed logs. Disable tracing first.
+            set +x
+            export HF_TOKEN="${{ secrets.HF_TOKEN }}"
+            # We rebuild the artifacts, so don't pull the existing LFS blobs.
+            export GIT_LFS_SKIP_SMUDGE=1
+
+            # Build the exact commit that triggered this workflow.
+            git clone "${{ github.server_url }}/${{ github.repository }}" fp8linear
+            cd fp8linear
+            git checkout "${{ github.sha }}"
+
+            nix run github:huggingface/kernels#kernel-builder -- build-and-upload \
+              --max-jobs 4 \
+              --cores 4 \
+              --repo-id drbh/fp8linear

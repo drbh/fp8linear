@@ -1,0 +1,36 @@
+#pragma once
+
+#include <torch/torch.h>
+
+// Dynamic per-tensor quantization of a fp16/bf16 activation tensor to
+// float8_e4m3fn. Returns (xq, scale) where x ~= xq * scale.
+//   x     : [..., K] fp16 or bf16, contiguous
+//   xq    : same shape, float8_e4m3fn
+//   scale : scalar fp32 tensor (amax / 448)
+std::tuple<torch::Tensor, torch::Tensor> quantize_fp8(torch::Tensor x);
+
+// FP8 matmul with per-tensor dequant scales, computed on tensor cores:
+//   out[M, N] = (xq @ wq^T) * x_scale * w_scale (+ bias)
+//   xq      : [M, K] float8_e4m3fn, row-major
+//   x_scale : scalar fp32
+//   wq      : [N, K] float8_e4m3fn, row-major (i.e. transposed weight)
+//   w_scale : scalar fp32
+//   bias    : optional [N] fp16
+//   out     : [M, N] fp16
+torch::Tensor fp8_gemm(torch::Tensor xq,
+                       torch::Tensor x_scale,
+                       torch::Tensor wq,
+                       torch::Tensor w_scale,
+                       std::optional<torch::Tensor> bias);
+
+// Fused dynamic-quant FP8 linear: quantizes x on the fly, then runs the FP8
+// matmul against an already-quantized weight. This is the op that recovers the
+// FP8 speedup that a naive (multi-pass) quantize would give back.
+//   x       : [M, K] fp16/bf16
+//   wq      : [N, K] float8_e4m3fn (pre-quantized weight)
+//   w_scale : scalar fp32 weight scale
+//   bias    : optional [N] fp16
+torch::Tensor fp8_linear(torch::Tensor x,
+                         torch::Tensor wq,
+                         torch::Tensor w_scale,
+                         std::optional<torch::Tensor> bias);

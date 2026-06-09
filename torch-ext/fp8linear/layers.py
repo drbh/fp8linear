@@ -1,0 +1,75 @@
+from __future__ import annotations
+
+import torch
+from torch import nn
+
+from ._ops import ops, add_op_namespace_prefix
+
+E4M3_MAX = 448.0
+
+
+# torch.compile support: fake/meta impls so Dynamo can trace shapes through the
+# ops without a graph break.
+@torch.library.register_fake(add_op_namespace_prefix("fp8_linear"))
+def _fp8_linear_fake(x, wq, w_scale, bias=None):
+    return x.new_empty((*x.shape[:-1], wq.shape[0]), dtype=torch.float16)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("quantize_fp8"))
+def _quantize_fp8_fake(x):
+    xq = x.new_empty(x.shape, dtype=torch.float8_e4m3fn)
+    scale = x.new_empty((x.shape[0],), dtype=torch.float32)
+    return xq, scale
+
+
+@torch.library.register_fake(add_op_namespace_prefix("fp8_gemm"))
+def _fp8_gemm_fake(xq, x_scale, wq, w_scale, bias=None):
+    return xq.new_empty((xq.shape[0], wq.shape[0]), dtype=torch.float16)
+
+
+def quantize_weight(weight: torch.Tensor):
+    """Per-channel (per-output-row) quantize a [N, K] weight to e4m3.
+
+    Returns (wq, w_scale) with weight[n] ~= wq[n] * w_scale[n]; w_scale is [N] fp32.
+    """
+    amax = weight.detach().abs().amax(dim=1).float()  # [N]
+    scale = (amax / E4M3_MAX).clamp_min(1e-12)  # [N]
+    wq = (
+        (weight.float() / scale[:, None])
+        .clamp_(-E4M3_MAX, E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+    return wq, scale
+
+
+def fp8_linear(x, wq, w_scale, bias=None):
+    """FP8 linear op for pre-quantized weights (`wq`/`w_scale` from quantize_weight)."""
+    return ops.fp8_linear(x, wq, w_scale, bias)
+
+
+class Fp8Linear(nn.Module):
+    """Stateless kernel layer: replaces an `nn.Linear`'s forward with an FP8 matmul.
+
+    Per the kernels layer contract this layer is pure -- it defines no constructor
+    and holds no state of its own. `kernelize()` grafts this `forward` onto an
+    existing `nn.Linear`, so it operates on that module's `weight`/`bias` (declared
+    below as type annotations, not class variables).
+
+    The weight is quantized to e4m3 per output channel on the fly and activations
+    are quantized per token by the fused kernel. If you have pre-quantized weights
+    (e4m3 `weight` + per-channel scale), call the `fp8_linear` op directly to skip
+    the per-call weight quantization.
+    """
+
+    # Member variables expected from the adopting nn.Linear (annotations only).
+    weight: torch.Tensor
+    bias: torch.Tensor | None
+
+    # Allowed class-variable exceptions to the no-state rule.
+    has_backward: bool = False
+    can_torch_compile: bool = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        wq, w_scale = quantize_weight(self.weight)
+        out = ops.fp8_linear(x, wq, w_scale, self.bias)
+        return out.to(x.dtype)
